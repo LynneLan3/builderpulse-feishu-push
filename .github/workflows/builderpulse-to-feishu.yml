@@ -5,7 +5,7 @@ on:
   schedule:
     # BuilderPulse 示例日报显示更新时间为 10:50（上海时间）
     # 这里放到 11:10 上海时间，尽量避开还没生成完的情况
-    - cron: "10 11 * * *"
+    - cron: "5 20 * * *"
       timezone: "Asia/Shanghai"
 
 jobs:
