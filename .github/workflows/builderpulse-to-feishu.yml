@@ -1,0 +1,184 @@
+name: Push BuilderPulse to Feishu
+
+on:
+  workflow_dispatch:
+  schedule:
+    # BuilderPulse 示例日报显示更新时间为 10:50（上海时间）
+    # 这里放到 11:10 上海时间，尽量避开还没生成完的情况
+    - cron: "10 11 * * *"
+      timezone: "Asia/Shanghai"
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch latest BuilderPulse zh report and send to Feishu
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import json
+          import time
+          import hmac
+          import base64
+          import hashlib
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from urllib.request import Request, urlopen
+
+          FEISHU_WEBHOOK = os.environ["FEISHU_WEBHOOK"]
+          FEISHU_SECRET = os.environ.get("FEISHU_SECRET", "").strip()
+
+          def http_get_json(url):
+              req = Request(
+                  url,
+                  headers={
+                      "User-Agent": "builderpulse-feishu-bot",
+                      "Accept": "application/vnd.github+json",
+                  },
+              )
+              with urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          def http_get_text(url):
+              req = Request(
+                  url,
+                  headers={"User-Agent": "builderpulse-feishu-bot"},
+              )
+              with urlopen(req, timeout=30) as resp:
+                  return resp.read().decode("utf-8")
+
+          def http_post_json(url, payload):
+              data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+              req = Request(
+                  url,
+                  data=data,
+                  headers={"Content-Type": "application/json; charset=utf-8"},
+                  method="POST",
+              )
+              with urlopen(req, timeout=30) as resp:
+                  body = resp.read().decode("utf-8", errors="ignore")
+                  print(body)
+                  result = json.loads(body)
+                  # 飞书常见返回：{"StatusCode":0,...} 或 {"code":0,...}
+                  if result.get("StatusCode", 0) not in (0, None):
+                      raise RuntimeError(body)
+                  if result.get("code", 0) not in (0, None):
+                      raise RuntimeError(body)
+
+          def gen_feishu_sign(secret: str):
+              timestamp = str(int(time.time()))
+              string_to_sign = f"{timestamp}\n{secret}"
+              sign = base64.b64encode(
+                  hmac.new(
+                      string_to_sign.encode("utf-8"),
+                      b"",
+                      digestmod=hashlib.sha256,
+                  ).digest()
+              ).decode("utf-8")
+              return timestamp, sign
+
+          def get_latest_report_meta(lang="zh"):
+              tz = ZoneInfo("Asia/Shanghai")
+              year = datetime.now(tz).year
+
+              api_url = f"https://api.github.com/repos/BuilderPulse/BuilderPulse/contents/{lang}/{year}"
+              items = http_get_json(api_url)
+
+              files = [
+                  x for x in items
+                  if x.get("type") == "file" and x.get("name", "").endswith(".md")
+              ]
+              if not files:
+                  raise RuntimeError(f"未找到 {lang}/{year} 下的日报文件")
+
+              files.sort(key=lambda x: x["name"])
+              return files[-1]
+
+          def parse_report(md_text: str):
+              lines = md_text.replace("\r\n", "\n").split("\n")
+
+              title = "BuilderPulse Daily"
+              for line in lines:
+                  if line.startswith("# "):
+                      title = line[2:].strip()
+                      break
+
+              bullets = []
+              in_top3 = False
+
+              for raw in lines:
+                  s = raw.strip()
+
+                  if ("今日三大信号" in s) or ("Today's top 3" in s):
+                      in_top3 = True
+                      continue
+
+                  if not in_top3:
+                      continue
+
+                  s = re.sub(r"^>\s*", "", s).strip()
+
+                  if re.match(r"^\d+\.\s+", s):
+                      bullets.append(s)
+
+                  if len(bullets) >= 3:
+                      break
+
+              preview = ""
+              if not bullets:
+                  preview = re.sub(r"\s+", " ", md_text)[:300]
+
+              return title, bullets, preview
+
+          meta = get_latest_report_meta(lang="zh")
+          md = http_get_text(meta["download_url"])
+          title, bullets, preview = parse_report(md)
+
+          report_url = meta["html_url"]
+          report_date = meta["name"].replace(".md", "")
+
+          content_rows = [
+              [{"tag": "text", "text": f"BuilderPulse 中文日报已更新：{report_date}"}],
+          ]
+
+          if bullets:
+              content_rows.append([{"tag": "text", "text": "今日三大信号："}])
+              for bullet in bullets:
+                  content_rows.append([{"tag": "text", "text": bullet}])
+          else:
+              content_rows.append([{"tag": "text", "text": preview}])
+
+          content_rows.extend([
+              [{"tag": "a", "text": "查看完整日报", "href": report_url}],
+              [{"tag": "text", "text": "来源：BuilderPulse/BuilderPulse"}],
+          ])
+
+          payload = {
+              "msg_type": "post",
+              "content": {
+                  "post": {
+                      "zh_cn": {
+                          "title": title,
+                          "content": content_rows,
+                      }
+                  }
+              }
+          }
+
+          if FEISHU_SECRET:
+              timestamp, sign = gen_feishu_sign(FEISHU_SECRET)
+              payload["timestamp"] = timestamp
+              payload["sign"] = sign
+
+          http_post_json(FEISHU_WEBHOOK, payload)
+          PY
